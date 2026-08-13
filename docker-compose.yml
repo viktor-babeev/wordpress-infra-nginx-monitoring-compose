@@ -1,0 +1,159 @@
+version: '3.8'
+
+services:
+  # Веб-сервер Nginx (Reverse Proxy) — Работает напрямую в сети хоста
+  nginx:
+    image: nginx:${NGINX_VERSION}
+    container_name: wp-nginx-proxy
+    restart: always
+    network_mode: host
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      wordpress:
+        condition: service_started
+      phpmyadmin:
+        condition: service_started
+      grafana:
+        condition: service_started
+
+  # Контейнер СУБД: MySQL (LTS)
+  db:
+    image: mysql:${MYSQL_VERSION}
+    container_name: wp-mysql-db
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+    ports:
+      - "127.0.0.1:3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u${MYSQL_USER}", "-p${MYSQL_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - wp-network
+
+  # Контейнер CMS: WordPress
+  wordpress:
+    image: wordpress:${WORDPRESS_VERSION}
+    container_name: wp-cms-app
+    restart: always
+    ports:
+      - "127.0.0.1:${WP_LOCAL_PORT}:80"
+    volumes:
+      - ./data/wp:/var/www/html
+    environment:
+      WORDPRESS_DB_HOST: db:3306
+      WORDPRESS_DB_USER: ${MYSQL_USER}
+      WORDPRESS_DB_PASSWORD: ${MYSQL_PASSWORD}
+      WORDPRESS_DB_NAME: ${MYSQL_DATABASE}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - wp-network
+
+  # Контейнер GUI: phpMyAdmin
+  phpmyadmin:
+    image: phpmyadmin:${PMA_VERSION}
+    container_name: wp-phpmyadmin-gui
+    restart: always
+    ports:
+      - "127.0.0.1:${PMA_LOCAL_PORT}:80"
+    environment:
+      PMA_HOST: db
+      PMA_PORT: 3306
+      PMA_ARBITRARY: 0
+      PMA_ABSOLUTE_URI: http://localhost/phpmyadmin/
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - wp-network
+
+  # ----------------------------------------------------------------------------
+  # СИСТЕМА МОНИТОРИНГА: Prometheus (НОВЫЙ)
+  # ----------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:${PROMETHEUS_VERSION}
+    container_name: wp-prometheus
+    restart: always
+    ports:
+      - "127.0.0.1:${PROM_LOCAL_PORT}:9090"
+    extra_hosts:
+      # Проброс DNS-записи для обращения из bridge-сети к сервисам на хост-машине (шлюз Docker-моста)
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Монтируем кастомный конфигурационный файл сбора метрик
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - wp-network
+
+  # ----------------------------------------------------------------------------
+  # СИСТЕМА ВИЗУАЛИЗАЦИИ: Grafana (НОВЫЙ)
+  # ----------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana-oss:${GRAFANA_VERSION}
+    container_name: wp-grafana
+    restart: always
+    ports:
+      - "127.0.0.1:${GRAFANA_LOCAL_PORT}:3000"
+    environment:
+      # Требование 3: Передаем логин/пароль администратора из .env
+      - GF_SECURITY_ADMIN_USER=${GF_SECURITY_ADMIN_USER}
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD}
+      # Требование 6: Настройки официальной документации для работы внутри подпути /grafana
+      - GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s:%(http_port)s/grafana/
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+    volumes:
+      - grafana_data:/var/lib/grafana
+      # Требование 5: Автоматическое монтирование файла конфигурации datasource
+      - ./grafana/provisioning/datasources/datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml:ro
+      # 2. ИСПРАВЛЕНИЕ: Монтируем ВСЮ папку dashboards целиком за один раз
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+    depends_on:
+      - prometheus
+    networks:
+      - wp-network
+
+  # ----------------------------------------------------------------------------
+  # СБОРЩИК МЕТРИК ХОСТА: Node Exporter (НОВЫЙ)
+  # ----------------------------------------------------------------------------
+  node-exporter:
+    image: prom/node-exporter:${NODE_EXPORTER_VERSION}
+    container_name: wp-node-exporter
+    restart: always
+    ports:
+      - "127.0.0.1:${NODE_EXPORTER_LOCAL_PORT}:9100" # Надежно запираем порт на localhost вашей Ubuntu
+    # Монтируем системные директории хоста в режиме read-only для сбора точных метрик железа
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+      # КРИТИЧЕСКИ ВАЖНО: Монтируем реальные сетевые интерфейсы Ubuntu в контейнер
+      - /sys/class/net:/host/sys/class/net:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($|/)'
+    networks:
+      - wp-network
+
+volumes:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  wp-network:
+    driver: bridge
